@@ -175,6 +175,9 @@ async def upload_document(
     # 새 자료 업로드됨 — 메모리 job 만 폐기 (옛 mp4 는 강의자료별 이름으로 보관됨)
     with _video_lock:
         _video_jobs.pop(student_id, None)
+    # 사전처리 캐시도 폐기 — 새 자료에 옛 요약·개념 쓰면 안 됨
+    with _pre_lock:
+        _pre_cache.pop(student_id, None)
 
     return {"status": "ok", "filename": filename, **info}
 
@@ -242,6 +245,7 @@ async def _analyze_stream(student_id: str):
     for type_key, prompt in PROMPTS:
         yield f"data: {json.dumps({'type': type_key, 'event': 'start'}, ensure_ascii=False)}\n\n"
         token_queue: queue.Queue = queue.Queue()
+        buf: list[str] = []
 
         def produce(p=prompt):
             try:
@@ -260,7 +264,13 @@ async def _analyze_stream(student_id: str):
             if isinstance(item, tuple):
                 yield f"data: {json.dumps({'type': 'error', 'content': item[1]}, ensure_ascii=False)}\n\n"
                 break
+            buf.append(item)
             yield f"data: {json.dumps({'type': type_key, 'event': 'token', 'token': item}, ensure_ascii=False)}\n\n"
+
+        # summary / concepts 는 영상 컨텍스트로 재사용 — 캐시에 저장
+        full = "".join(buf).strip()
+        if full and type_key in ("summary", "concepts"):
+            _pre_set(student_id, type_key, full)
 
         yield f"data: {json.dumps({'type': type_key, 'event': 'done'}, ensure_ascii=False)}\n\n"
     yield 'data: {"type":"done"}\n\n'
@@ -273,6 +283,103 @@ async def analyze(user=Depends(get_user_from_query)):
         raise HTTPException(status_code=400, detail="문서 업로드 필요")
     return StreamingResponse(
         _analyze_stream(sid),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ── 사전처리 체인 (요약 → 핵심개념 → 영상) ────────
+# 학생 입장: 업로드 → 빠른 요약 → 개념 정리 → 그 둘 기반 영상
+# /analyze 는 요약+개념+시험 풀스트림 (학생 능동 요청)
+# /summary, /concepts 는 단독 endpoint — 사전처리 체인용
+
+_SUMMARY_PROMPT  = next(p for k, p in PROMPTS if k == "summary")
+_CONCEPTS_PROMPT = next(p for k, p in PROMPTS if k == "concepts")
+_EXAM_PROMPT     = next(p for k, p in PROMPTS if k == "exam")
+
+# 사전처리 캐시 — 영상 생성 시 raw 문서 대신 요약+개념 사용
+_pre_cache: dict[str, dict] = {}   # sid → {"summary": str, "concepts": str}
+_pre_lock  = threading.RLock()
+
+
+def _pre_set(sid: str, key: str, text: str) -> None:
+    with _pre_lock:
+        d = _pre_cache.setdefault(sid, {})
+        d[key] = text
+
+
+def _pre_get(sid: str) -> dict:
+    with _pre_lock:
+        return dict(_pre_cache.get(sid, {}))
+
+
+async def _single_prompt_stream(student_id: str, key: str, prompt: str):
+    """공통 단발 SSE — 토큰 스트림 + 종료 시 캐시 저장."""
+    loop = asyncio.get_running_loop()
+    yield f"data: {json.dumps({'event': 'start', 'type': key}, ensure_ascii=False)}\n\n"
+    token_queue: queue.Queue = queue.Queue()
+    buf = []
+
+    def produce():
+        try:
+            for token in ask_full_stream(prompt, student_id):
+                token_queue.put(token)
+        except Exception as e:
+            token_queue.put(('__error__', str(e)))
+        finally:
+            token_queue.put(None)
+
+    loop.run_in_executor(llm_executor, produce)
+    while True:
+        item = await loop.run_in_executor(None, token_queue.get)
+        if item is None:
+            break
+        if isinstance(item, tuple):
+            yield f"data: {json.dumps({'event': 'error', 'type': key, 'content': item[1]}, ensure_ascii=False)}\n\n"
+            return
+        buf.append(item)
+        yield f"data: {json.dumps({'event': 'token', 'type': key, 'token': item}, ensure_ascii=False)}\n\n"
+
+    full = "".join(buf).strip()
+    if full:
+        _pre_set(student_id, key, full)
+    yield f"data: {json.dumps({'event': 'done', 'type': key}, ensure_ascii=False)}\n\n"
+
+
+@app.get("/summary")
+async def summary_only(user=Depends(get_user_from_query)):
+    """빠른 요약 — 학생 첫 인상."""
+    sid = user["student_id"]
+    if not has_state(sid):
+        raise HTTPException(status_code=400, detail="문서 업로드 필요")
+    return StreamingResponse(
+        _single_prompt_stream(sid, "summary", _SUMMARY_PROMPT),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/concepts")
+async def concepts_only(user=Depends(get_user_from_query)):
+    """핵심 개념 단독."""
+    sid = user["student_id"]
+    if not has_state(sid):
+        raise HTTPException(status_code=400, detail="문서 업로드 필요")
+    return StreamingResponse(
+        _single_prompt_stream(sid, "concepts", _CONCEPTS_PROMPT),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/exam")
+async def exam_only(user=Depends(get_user_from_query)):
+    """예상 문제 단독."""
+    sid = user["student_id"]
+    if not has_state(sid):
+        raise HTTPException(status_code=400, detail="문서 업로드 필요")
+    return StreamingResponse(
+        _single_prompt_stream(sid, "exam", _EXAM_PROMPT),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -450,6 +557,23 @@ def _video_path(student_id, source_filename=None):
     return os.path.join(BASE_DIR, f"lecture_{student_id}_{_safe_name(source_filename)}.mp4")
 
 
+def _video_context(sid: str) -> str:
+    """영상 스크립트용 컨텍스트 — 사전처리된 요약+개념 우선, 없으면 원본 발췌.
+    요약+개념은 LLM이 정제한 결과라 스크립트 품질↑ + 토큰 소모↓."""
+    pre = _pre_get(sid)
+    summary  = pre.get("summary",  "").strip()
+    concepts = pre.get("concepts", "").strip()
+    if summary and concepts:
+        return (
+            f"[강의 요약]\n{summary}\n\n"
+            f"[핵심 개념]\n{concepts}\n\n"
+            f"[원본 발췌]\n{_full_context(sid, max_chars=2000)}"
+        )
+    if summary:
+        return f"[강의 요약]\n{summary}\n\n[원본 발췌]\n{_full_context(sid, max_chars=3000)}"
+    return _full_context(sid)
+
+
 @app.get("/generate-video")
 async def generate_video(user=Depends(get_user_from_query)):
     """SSE: 진행 상황 토큰 + 완료 시 download URL."""
@@ -472,7 +596,7 @@ async def generate_video(user=Depends(get_user_from_query)):
         def produce():
             try:
                 level_info = get_student_level(sid)
-                context    = _full_context(sid)
+                context    = _video_context(sid)
                 out_path   = _video_path(sid)
                 if not out_path:
                     raise RuntimeError("강의자료 메타 없음")
@@ -566,7 +690,7 @@ async def start_video_generation(user=Depends(get_current_user)):
     def worker():
         try:
             level_info = get_student_level(sid)
-            context    = _full_context(sid)
+            context    = _video_context(sid)
             out_path   = _video_path(sid)
             if not out_path:
                 raise RuntimeError("강의자료 메타 없음")

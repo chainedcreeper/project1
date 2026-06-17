@@ -55,14 +55,21 @@ def _messages(context, question, level_info=None):
     ]
 
 
-def _post_ollama(context, question, level_info=None, stream=False):
-    """게이트 잡기 전의 raw POST. 호출자가 게이트 잡고 있어야 함."""
+def _post_ollama(context, question, level_info=None, stream=False, *, max_tokens=None, ctx_size=None):
+    """게이트 잡기 전의 raw POST. 호출자가 게이트 잡고 있어야 함.
+    max_tokens / ctx_size 명시 시 우선 (채팅 같은 짧은 응답용)."""
     model = _resolve_model(level_info)
     model_lc = model.lower()
     is_large = any(k in model_lc for k in ("32b", "30b", "70b", "27b", "exaone3.5:32"))
-    # 32B 는 토큰 생성 ~10 tok/s → 1024 면 100초. 그래도 시연용으론 한계
-    num_predict = 1024 if is_large else 16384
-    num_ctx     = 8192 if is_large else 16384
+
+    if max_tokens is not None:
+        num_predict = max_tokens
+    else:
+        num_predict = 1024 if is_large else 16384
+    if ctx_size is not None:
+        num_ctx = ctx_size
+    else:
+        num_ctx = 8192 if is_large else 16384
 
     resp = requests.post(
         f"{OLLAMA_HOST}/api/chat",
@@ -104,16 +111,16 @@ def _strip_reasoning_prefix(text, prefer_json=False):
     return text[cut:] if cut > 0 else text
 
 
-def ask_qwen(context, question, level_info=None, *, prefer_json=False):
+def ask_qwen(context, question, level_info=None, *, prefer_json=False, max_tokens=None, ctx_size=None):
     with llm_gate.acquire():
-        raw = _post_ollama(context, question, level_info, stream=False).json()["message"]["content"]
+        raw = _post_ollama(context, question, level_info, stream=False, max_tokens=max_tokens, ctx_size=ctx_size).json()["message"]["content"]
     return _strip_reasoning_prefix(raw, prefer_json=prefer_json)
 
 
 _HANGUL_RE = re.compile(r"[가-힣]")
 
 
-def ask_qwen_stream(context, question, level_info=None):
+def ask_qwen_stream(context, question, level_info=None, *, max_tokens=None, ctx_size=None):
     """영어 reasoning prefix (Okay, Let me ...) 자동 필터.
     첫 한국어 글자 또는 형식 마커(`1.`, `[`, `▶`, `#`) 가 나오기 전까지 버퍼링.
     스트림이 끝날 때까지 LLM 게이트 보유 — GPU 1장 직렬화 유지.
@@ -121,7 +128,7 @@ def ask_qwen_stream(context, question, level_info=None):
     buf       = ""
     started   = False
     with llm_gate.acquire():
-        for line in _post_ollama(context, question, level_info, stream=True).iter_lines():
+        for line in _post_ollama(context, question, level_info, stream=True, max_tokens=max_tokens, ctx_size=ctx_size).iter_lines():
             if not line:
                 continue
             token = json.loads(line).get("message", {}).get("content", "")

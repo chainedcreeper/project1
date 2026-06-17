@@ -49,18 +49,25 @@ def _require_state(student_id: str) -> dict:
     return state
 
 
-def _get_context(question: str, student_id: str, *, initial_k: int = 20, final_k: int = 3) -> str:
+def _get_context(question: str, student_id: str, *, initial_k: int = 20, final_k: int = 3, skip_rerank: bool = False) -> str:
     state    = _require_state(student_id)
     parents  = state["parents"]
     children = state["children"]
     index    = state["index"]
 
-    k     = min(initial_k, len(children))
+    # skip_rerank — FAISS top-k 만 사용. CPU reranker (~1~2초) 건너뜀 → 채팅 빠르게
+    if skip_rerank:
+        k = min(final_k * 2, len(children))   # 후보 좀 더 잡아서 페이지 다양성
+    else:
+        k = min(initial_k, len(children))
     q_emb = model.encode([question], normalize_embeddings=True)
     _, I  = index.search(np.array(q_emb, dtype="float32"), k=k)
 
-    candidates   = [children[idx] for idx in I[0] if idx < len(children)]
-    top_children = rerank(question, candidates, top_k=min(final_k, len(candidates)))
+    candidates = [children[idx] for idx in I[0] if idx < len(children)]
+    if skip_rerank:
+        top_children = candidates[:final_k]
+    else:
+        top_children = rerank(question, candidates, top_k=min(final_k, len(candidates)))
 
     context, seen = "", set()
     for child in top_children:
@@ -211,13 +218,19 @@ def get_parents(student_id: str) -> list[dict]:
 
 
 # ── 답변 생성 ────────────────────────────────────────
+# FAST_CHAT — 채팅 빠르게 (reranker 건너뜀, 응답 토큰 캡). 환경변수 0 으로 끄면 정확도 우선.
+import os as _os
+_FAST_CHAT = _os.getenv("FAST_CHAT", "1") == "1"
+
 
 def ask(question: str, student_id: str, level_info=None):
-    return ask_qwen(_get_context(question, student_id), question, level_info)
+    return ask_qwen(_get_context(question, student_id, skip_rerank=_FAST_CHAT), question, level_info)
 
 
 def ask_stream(question: str, student_id: str, level_info=None):
-    yield from ask_qwen_stream(_get_context(question, student_id), question, level_info)
+    """채팅용 — 짧고 빠르게. 컨텍스트는 FAISS 직접 (reranker 건너뜀)."""
+    ctx = _get_context(question, student_id, skip_rerank=_FAST_CHAT)
+    yield from ask_qwen_stream(ctx, question, level_info, max_tokens=2048, ctx_size=8192)
 
 
 def ask_full(question: str, student_id: str, max_tokens: int = 6000):

@@ -15,3 +15,7 @@ venv/
 .venv/
 local.env
 *.env
+rag_indexes/
+test_*.mp4
+note.txt
+-w
