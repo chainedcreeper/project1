@@ -5,8 +5,25 @@ import re
 
 import requests
 
+from .gateway import llm_gate
+
 OLLAMA_HOST  = os.getenv("OLLAMA_HOST",  "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
+
+# 수준별 라우팅 — 입문/중급은 8B 강제 (어차피 큰 모델 필요 없는 질문 위주)
+# 심화만 사용자가 고른 모델 사용. 32B GPU 부담 감소.
+LIGHT_MODEL  = os.getenv("LIGHT_MODEL",  "qwen3:8b")
+AUTO_ROUTE   = os.getenv("AUTO_ROUTE_BY_LEVEL", "1") == "1"
+
+
+def _resolve_model(level_info):
+    """수준별 라우팅. 입문/중급 → LIGHT_MODEL. 심화 또는 정보 없음 → 사용자 선택."""
+    if not AUTO_ROUTE or not level_info:
+        return OLLAMA_MODEL
+    label = (level_info.get("label") or "").strip()
+    if label in ("입문", "중급"):
+        return LIGHT_MODEL
+    return OLLAMA_MODEL
 
 _LEVEL_GUIDE = {
     "입문": "학생은 이 분야가 처음이다. 전문 용어를 최대한 피하고, 일상적인 비유와 쉬운 예시로 설명해라.",
@@ -38,18 +55,19 @@ def _messages(context, question, level_info=None):
     ]
 
 
-def _call_ollama(context, question, level_info=None, stream=False):
-    # 모델 크기에 따라 응답 토큰 한도 자동 조절
-    # 큰 모델은 토큰 생성 속도가 느리므로 응답 짧게 → 시연 시간 단축
-    model_lc = OLLAMA_MODEL.lower()
+def _post_ollama(context, question, level_info=None, stream=False):
+    """게이트 잡기 전의 raw POST. 호출자가 게이트 잡고 있어야 함."""
+    model = _resolve_model(level_info)
+    model_lc = model.lower()
     is_large = any(k in model_lc for k in ("32b", "30b", "70b", "27b", "exaone3.5:32"))
-    num_predict = 2048 if is_large else 16384   # 큰 모델은 응답 짧게 (시연 시간 단축)
+    # 32B 는 토큰 생성 ~10 tok/s → 1024 면 100초. 그래도 시연용으론 한계
+    num_predict = 1024 if is_large else 16384
     num_ctx     = 8192 if is_large else 16384
 
     resp = requests.post(
         f"{OLLAMA_HOST}/api/chat",
         json={
-            "model":    OLLAMA_MODEL,
+            "model":    model,
             "messages": _messages(context, question, level_info),
             "stream":   stream,
             "think":    False,
@@ -58,7 +76,7 @@ def _call_ollama(context, question, level_info=None, stream=False):
                 "num_ctx":     num_ctx,
             },
         },
-        timeout=900,    # 큰 모델 대비
+        timeout=900,
         stream=stream,
     )
     resp.raise_for_status()
@@ -87,7 +105,8 @@ def _strip_reasoning_prefix(text, prefer_json=False):
 
 
 def ask_qwen(context, question, level_info=None, *, prefer_json=False):
-    raw = _call_ollama(context, question, level_info, stream=False).json()["message"]["content"]
+    with llm_gate.acquire():
+        raw = _post_ollama(context, question, level_info, stream=False).json()["message"]["content"]
     return _strip_reasoning_prefix(raw, prefer_json=prefer_json)
 
 
@@ -97,30 +116,30 @@ _HANGUL_RE = re.compile(r"[가-힣]")
 def ask_qwen_stream(context, question, level_info=None):
     """영어 reasoning prefix (Okay, Let me ...) 자동 필터.
     첫 한국어 글자 또는 형식 마커(`1.`, `[`, `▶`, `#`) 가 나오기 전까지 버퍼링.
+    스트림이 끝날 때까지 LLM 게이트 보유 — GPU 1장 직렬화 유지.
     """
     buf       = ""
     started   = False
-    for line in _call_ollama(context, question, level_info, stream=True).iter_lines():
-        if not line:
-            continue
-        token = json.loads(line).get("message", {}).get("content", "")
-        if not token:
-            continue
-        if started:
-            yield token
-            continue
-        buf += token
-        # 한국어 또는 형식 마커 발견 시 시작 — 그 위치부터 yield
-        m = _HANGUL_RE.search(buf)
-        markers = [buf.find(c) for c in ("1.", "[", "▶", "#", "▷", "✓")]
-        markers = [i for i in markers if i >= 0]
-        cut = m.start() if m else (min(markers) if markers else -1)
-        if cut >= 0:
-            yield buf[cut:]
-            buf = ""
-            started = True
-        # 너무 길어지면 강제 시작 (안전장치)
-        elif len(buf) > 2000:
-            yield buf
-            buf = ""
-            started = True
+    with llm_gate.acquire():
+        for line in _post_ollama(context, question, level_info, stream=True).iter_lines():
+            if not line:
+                continue
+            token = json.loads(line).get("message", {}).get("content", "")
+            if not token:
+                continue
+            if started:
+                yield token
+                continue
+            buf += token
+            m = _HANGUL_RE.search(buf)
+            markers = [buf.find(c) for c in ("1.", "[", "▶", "#", "▷", "✓")]
+            markers = [i for i in markers if i >= 0]
+            cut = m.start() if m else (min(markers) if markers else -1)
+            if cut >= 0:
+                yield buf[cut:]
+                buf = ""
+                started = True
+            elif len(buf) > 2000:
+                yield buf
+                buf = ""
+                started = True

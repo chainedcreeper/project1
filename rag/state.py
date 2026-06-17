@@ -32,11 +32,13 @@ def _student_dir(student_id: str) -> str:
     return os.path.join(INDEX_DIR, student_id)
 
 
+def _index_mtime(student_id: str) -> float:
+    p = os.path.join(_student_dir(student_id), "faiss.index")
+    return os.path.getmtime(p) if os.path.exists(p) else 0.0
+
+
 def has_state(student_id: str) -> bool:
-    """메모리 또는 디스크에 인덱스 있나."""
-    with _lock:
-        if student_id in _cache:
-            return True
+    """디스크 우선 — 멀티 워커 환경에서도 일관."""
     return os.path.exists(os.path.join(_student_dir(student_id), "faiss.index"))
 
 
@@ -55,27 +57,35 @@ def save_state(student_id: str, parents: list[dict], children: list[dict], index
     faiss.write_index(index, os.path.join(d, "faiss.index"))
 
     with _lock:
-        _cache[student_id] = {"parents": parents, "children": children, "index": index}
+        _cache[student_id] = {
+            "parents":  parents,
+            "children": children,
+            "index":    index,
+            "_mtime":   _index_mtime(student_id),
+        }
 
 
 def load_state(student_id: str) -> dict | None:
-    """메모리 → 디스크 순으로 로드. 없으면 None."""
+    """메모리 → 디스크 순으로 로드. 디스크 mtime 이 캐시보다 새로우면 강제 재로드.
+    멀티 워커 환경에서 다른 워커가 새 자료 올린 걸 감지."""
+    disk_mtime = _index_mtime(student_id)
+    if not disk_mtime:
+        return None
+
     with _lock:
-        if student_id in _cache:
-            return _cache[student_id]
+        cached = _cache.get(student_id)
+        if cached and cached.get("_mtime", 0) >= disk_mtime:
+            return cached
 
     d = _student_dir(student_id)
     idx_path = os.path.join(d, "faiss.index")
-    if not os.path.exists(idx_path):
-        return None
-
     with open(os.path.join(d, "parents.json"),  encoding="utf-8") as f:
         parents = json.load(f)
     with open(os.path.join(d, "children.json"), encoding="utf-8") as f:
         children = json.load(f)
     index = faiss.read_index(idx_path)
 
-    state = {"parents": parents, "children": children, "index": index}
+    state = {"parents": parents, "children": children, "index": index, "_mtime": disk_mtime}
     with _lock:
         _cache[student_id] = state
     return state

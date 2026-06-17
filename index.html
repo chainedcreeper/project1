@@ -288,12 +288,21 @@
   <aside class="w-80 bg-white border-l border-slate-200 flex flex-col shrink-0">
 
     <!-- Chat header -->
-    <div class="px-4 py-3 border-b border-slate-200 shrink-0 flex items-center gap-2">
+    <div class="px-4 py-2.5 border-b border-slate-200 shrink-0 flex items-center gap-2">
       <span class="text-sm">💬</span>
       <p class="text-xs font-semibold text-slate-700">강의 자료 질의응답</p>
       <span id="levelBadge" class="ml-auto text-[10px] px-2 py-0.5 rounded-full bg-slate-100 text-slate-400 hidden"></span>
       <span class="w-2 h-2 rounded-full bg-slate-300" id="chatDot"></span>
     </div>
+
+    <!-- Mode toggle: 답변 받기 / 근거 찾기 -->
+    <div class="px-3 py-2 border-b border-slate-100 shrink-0 flex gap-1.5">
+      <button id="modeAskBtn" onclick="setChatMode('ask')"
+              class="flex-1 text-[11px] font-semibold py-1.5 rounded-md bg-indigo-500 text-white">💬 답변 받기</button>
+      <button id="modeFindBtn" onclick="setChatMode('find')"
+              class="flex-1 text-[11px] font-medium py-1.5 rounded-md bg-slate-100 text-slate-500 hover:bg-slate-200">🔍 근거 찾기</button>
+    </div>
+    <div id="queueHint" class="hidden px-3 py-1.5 text-[10px] text-amber-700 bg-amber-50 border-b border-amber-200"></div>
 
     <!-- Messages -->
     <div id="chatLog" class="flex-1 overflow-y-auto p-3 space-y-2.5">
@@ -1210,6 +1219,40 @@ async function syncVideoOnEnter() {
 
 /* ── Chat ── */
 const chatLog = document.getElementById('chatLog');
+let chatMode = 'ask';   // 'ask' | 'find'
+
+function setChatMode(m) {
+  chatMode = m;
+  const ask  = document.getElementById('modeAskBtn');
+  const find = document.getElementById('modeFindBtn');
+  const input = document.getElementById('chatInput');
+  if (m === 'ask') {
+    ask.className  = 'flex-1 text-[11px] font-semibold py-1.5 rounded-md bg-indigo-500 text-white';
+    find.className = 'flex-1 text-[11px] font-medium py-1.5 rounded-md bg-slate-100 text-slate-500 hover:bg-slate-200';
+    input.placeholder = '질문을 입력하세요…';
+  } else {
+    find.className = 'flex-1 text-[11px] font-semibold py-1.5 rounded-md bg-amber-500 text-white';
+    ask.className  = 'flex-1 text-[11px] font-medium py-1.5 rounded-md bg-slate-100 text-slate-500 hover:bg-slate-200';
+    input.placeholder = '키워드 / 구문 입력 (Ctrl-F 처럼)';
+  }
+}
+
+/* LLM 큐 상태 폴링 — 답변 보내기 전에 대기열 알려줌 */
+async function pollQueueOnce() {
+  try {
+    const r = await fetch('/llm-status');
+    if (!r.ok) return;
+    const d = await r.json();
+    const hint = document.getElementById('queueHint');
+    if (d.waiting > 0 || d.active >= d.capacity) {
+      hint.classList.remove('hidden');
+      hint.textContent = `⏳ 다른 학생이 LLM 사용 중 (처리: ${d.active}/${d.capacity}, 대기: ${d.waiting}) — 답변이 늦을 수 있음`;
+    } else {
+      hint.classList.add('hidden');
+    }
+  } catch {}
+}
+setInterval(pollQueueOnce, 4000);
 
 async function sendChat() {
   const input = document.getElementById('chatInput');
@@ -1217,6 +1260,31 @@ async function sendChat() {
   if (!msg) return;
   input.value = '';
   addBubble(msg, true);
+
+  /* 🔍 근거 찾기 모드 — LLM 안 거치고 즉시 검색 */
+  if (chatMode === 'find') {
+    const tid = addTyping();
+    try {
+      const r = await fetch('/find', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeader() },
+        body: JSON.stringify({ query: msg, top_k: 5 }),
+      });
+      document.getElementById(tid)?.remove();
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        addBubble(d.detail || '검색 실패', false);
+        return;
+      }
+      const d = await r.json();
+      addFindResults(d.results || []);
+    } catch {
+      document.getElementById(tid)?.remove();
+      addBubble('검색 오류', false);
+    }
+    return;
+  }
+
   const tid = addTyping();
   try {
     const r = await fetch('/chat', {
@@ -1265,6 +1333,45 @@ async function sendChat() {
     document.getElementById(tid)?.remove();
     addBubble('오류가 발생했습니다.', false);
   }
+}
+
+function addFindResults(results) {
+  if (!results || !results.length) {
+    addBubble('🔍 일치하는 부분 없음. 다른 키워드로 시도해줘.', false);
+    return;
+  }
+  const fuzzyCount = results.filter(r => r.match === 'fuzzy').length;
+  const wrap = document.createElement('div');
+  wrap.className = 'flex fade-up justify-start w-full';
+  const inner = document.createElement('div');
+  inner.className = 'bg-amber-50 border border-amber-200 rounded-2xl rounded-tl-sm px-3 py-2.5 text-xs max-w-[90%] space-y-2';
+  inner.innerHTML = `
+    <div class="text-[10px] font-semibold text-amber-700 flex items-center gap-1">
+      🔍 검색 결과 ${results.length}건 <span class="text-amber-500">·</span> <span class="text-amber-500">근거 페이지</span>
+      ${fuzzyCount ? `<span class="ml-1 text-[9px] text-purple-600">· 유사 ${fuzzyCount}건 포함</span>` : ''}
+    </div>
+    ${results.map(r => {
+      const isFuzzy = r.match === 'fuzzy';
+      const badge   = isFuzzy
+        ? `<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-100 text-purple-700">유사</span>`
+        : '';
+      const scoreText = isFuzzy ? `유사도 ${(r.score * 100).toFixed(0)}%` : `match ${r.score}`;
+      const borderCol = isFuzzy ? 'border-purple-200' : 'border-amber-200';
+      return `
+      <div class="bg-white border ${borderCol} rounded-md px-2.5 py-2">
+        <div class="flex items-center gap-1.5 mb-1">
+          <span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700">p.${r.page}</span>
+          ${badge}
+          <span class="text-[9px] text-slate-400">${scoreText}</span>
+        </div>
+        <p class="text-[11px] text-slate-700 leading-[1.6] whitespace-pre-wrap">${escapeHtml(r.snippet)}</p>
+      </div>
+      `;
+    }).join('')}
+  `;
+  wrap.appendChild(inner);
+  chatLog.appendChild(wrap);
+  chatLog.scrollTop = chatLog.scrollHeight;
 }
 
 function addStreamBubble() {

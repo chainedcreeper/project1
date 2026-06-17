@@ -27,6 +27,7 @@ from rag import (
     process_document, ask_stream, ask_full_stream,
     generate_qa_pairs, save_qa_pairs,
     get_parents, has_state, get_meta,
+    quick_find,
 )
 from rag.core import _get_context, _full_context
 from document import SUPPORTED_EXTS
@@ -40,6 +41,7 @@ from llm import (
     personal_model_exists, ask_personal_stream,
     ask_server_stream, is_server_available,
 )
+from llm.gateway import llm_gate
 from auth import (
     init_auth_db, register_user, authenticate_user, create_token,
     get_current_user, get_user_from_query,
@@ -54,7 +56,12 @@ init_schedule_db()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app      = FastAPI()
-executor = ThreadPoolExecutor(max_workers=4)
+# 두 풀로 분리:
+#  - executor      : 검색·임베딩·디스크 IO. /find, /document-status, 업로드 등.
+#  - llm_executor  : /chat /analyze /generate-video produce. 게이트 대기 잡혀도
+#                    위 풀은 멀쩡해서 빠른 검색 응답 가능.
+executor     = ThreadPoolExecutor(max_workers=int(os.getenv("WORKER_POOL", "8")))
+llm_executor = ThreadPoolExecutor(max_workers=int(os.getenv("LLM_POOL",    "8")))
 
 
 # ── 모델 ────────────────────────────────────────────
@@ -67,6 +74,11 @@ class RegisterRequest(BaseModel):
 
 class ChatMessage(BaseModel):
     message: str
+
+
+class FindRequest(BaseModel):
+    query: str
+    top_k: int = 5
 
 
 class NoteRequest(BaseModel):
@@ -240,7 +252,7 @@ async def _analyze_stream(student_id: str):
             finally:
                 token_queue.put(None)
 
-        loop.run_in_executor(executor, produce)
+        loop.run_in_executor(llm_executor, produce)
         while True:
             item = await loop.run_in_executor(None, token_queue.get)
             if item is None:
@@ -339,7 +351,7 @@ async def chat(msg: ChatMessage, user=Depends(get_current_user)):
                 token_queue.put(None)
 
         loop = asyncio.get_running_loop()
-        loop.run_in_executor(executor, produce)
+        loop.run_in_executor(llm_executor, produce)
 
         train_ready = False
         while True:
@@ -357,6 +369,27 @@ async def chat(msg: ChatMessage, user=Depends(get_current_user)):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ── 빠른 키워드 검색 (LLM 안 거침, sub-second) ─────
+
+@app.post("/find")
+async def find(req: FindRequest, user=Depends(get_current_user)):
+    sid = user["student_id"]
+    if not has_state(sid):
+        raise HTTPException(status_code=400, detail="문서 업로드 필요")
+    loop = asyncio.get_running_loop()
+    results = await loop.run_in_executor(
+        executor, lambda: quick_find(req.query, sid, top_k=max(1, min(20, req.top_k))),
+    )
+    return {"query": req.query, "results": results}
+
+
+# ── LLM 게이트 상태 (동시 접속 모니터링) ────────────
+
+@app.get("/llm-status")
+async def llm_status():
+    return llm_gate.stats()
 
 
 # ── 모델 전환 ──────────────────────────────────────
@@ -452,7 +485,7 @@ async def generate_video(user=Depends(get_user_from_query)):
                 event_queue.put(None)
 
         loop = asyncio.get_running_loop()
-        loop.run_in_executor(executor, produce)
+        loop.run_in_executor(llm_executor, produce)
 
         yield f"data: {json.dumps({'stage': 'start', 'msg': '인강 생성 시작'}, ensure_ascii=False)}\n\n"
         # cloudflared / nginx 등 reverse proxy 의 buffering 방지용 패딩 (2KB)
@@ -613,7 +646,7 @@ async def generate_qa(user=Depends(get_user_from_query)):
                 progress_queue.put((0, 0, True))
 
         loop = asyncio.get_running_loop()
-        loop.run_in_executor(executor, produce)
+        loop.run_in_executor(llm_executor, produce)
 
         while True:
             current, total, done = await loop.run_in_executor(None, progress_queue.get)
@@ -707,4 +740,17 @@ async def del_schedule(sched_id: int, user=Depends(get_current_user)):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=7860)
+    # 학교 서버 운영용 ENV:
+    #   APP_HOST=0.0.0.0  APP_PORT=7860
+    #   APP_WORKERS=1     (Ollama 단일 GPU 라 워커 1 권장 - 모델 RAM 중복 회피)
+    #   WORKER_POOL=8     (검색 / IO 스레드풀 크기)
+    #   LLM_CONCURRENCY=1 (LLM 게이트 동시 처리)
+    host    = os.getenv("APP_HOST", "0.0.0.0")
+    port    = int(os.getenv("APP_PORT", "7860"))
+    workers = int(os.getenv("APP_WORKERS", "1"))
+    if workers > 1:
+        # 멀티 워커 모드 — 모듈 경로 문자열로 넘겨야 함
+        uvicorn.run("app:app", host=host, port=port, workers=workers,
+                    timeout_keep_alive=30)
+    else:
+        uvicorn.run(app, host=host, port=port, timeout_keep_alive=30)

@@ -7,7 +7,7 @@ from . import core
 from .core import (
     process_document, process_pdf,
     ask, ask_stream, ask_full, ask_full_stream,
-    get_parents,
+    get_parents, quick_find,
 )
 from .qa    import generate_qa_pairs, save_qa_pairs
 from .state import has_state, load_state, save_state, clear_state, get_meta
@@ -16,7 +16,7 @@ __all__ = [
     "core",
     "process_document", "process_pdf",
     "ask", "ask_stream", "ask_full", "ask_full_stream",
-    "get_parents",
+    "get_parents", "quick_find",
     "generate_qa_pairs", "save_qa_pairs",
     "has_state", "load_state", "save_state", "clear_state", "get_meta",
 ]

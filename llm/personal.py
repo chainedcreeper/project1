@@ -5,6 +5,8 @@ import subprocess
 
 import requests
 
+from .gateway import llm_gate
+
 MODELS_DIR  = "personal_models"
 OLLAMA_URL  = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
@@ -42,31 +44,33 @@ def _build_prompt(context: str, question: str) -> str:
 
 
 def ask_personal(student_id: str, context: str, question: str) -> str:
-    resp = requests.post(
-        f"{OLLAMA_URL}/api/generate",
-        json={
-            "model":   personal_model_name(student_id),
-            "prompt":  _build_prompt(context, question),
-            "stream":  False,
-            "options": {"num_predict": 512, "num_ctx": 2048},
-        },
-    )
+    with llm_gate.acquire():
+        resp = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={
+                "model":   personal_model_name(student_id),
+                "prompt":  _build_prompt(context, question),
+                "stream":  False,
+                "options": {"num_predict": 512, "num_ctx": 2048},
+            },
+        )
     return resp.json()["response"]
 
 
 def ask_personal_stream(student_id: str, context: str, question: str):
-    resp = requests.post(
-        f"{OLLAMA_URL}/api/generate",
-        json={
-            "model":   personal_model_name(student_id),
-            "prompt":  _build_prompt(context, question),
-            "stream":  True,
-            "options": {"num_predict": 512, "num_ctx": 2048},
-        },
-        stream=True,
-    )
-    for line in resp.iter_lines():
-        if line:
-            token = json.loads(line).get("response", "")
-            if token:
-                yield token
+    with llm_gate.acquire():
+        resp = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={
+                "model":   personal_model_name(student_id),
+                "prompt":  _build_prompt(context, question),
+                "stream":  True,
+                "options": {"num_predict": 512, "num_ctx": 2048},
+            },
+            stream=True,
+        )
+        for line in resp.iter_lines():
+            if line:
+                token = json.loads(line).get("response", "")
+                if token:
+                    yield token
