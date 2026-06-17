@@ -5,7 +5,7 @@ import re
 
 import requests
 
-from .gateway import llm_gate
+from .gateway import llm_gate, gate_for
 
 OLLAMA_HOST  = os.getenv("OLLAMA_HOST",  "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
@@ -112,7 +112,8 @@ def _strip_reasoning_prefix(text, prefer_json=False):
 
 
 def ask_qwen(context, question, level_info=None, *, prefer_json=False, max_tokens=None, ctx_size=None):
-    with llm_gate.acquire():
+    model = _resolve_model(level_info)
+    with gate_for(model).acquire():
         raw = _post_ollama(context, question, level_info, stream=False, max_tokens=max_tokens, ctx_size=ctx_size).json()["message"]["content"]
     return _strip_reasoning_prefix(raw, prefer_json=prefer_json)
 
@@ -127,7 +128,8 @@ def ask_qwen_stream(context, question, level_info=None, *, max_tokens=None, ctx_
     """
     buf       = ""
     started   = False
-    with llm_gate.acquire():
+    model     = _resolve_model(level_info)
+    with gate_for(model).acquire():
         for line in _post_ollama(context, question, level_info, stream=True, max_tokens=max_tokens, ctx_size=ctx_size).iter_lines():
             if not line:
                 continue

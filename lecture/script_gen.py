@@ -171,15 +171,53 @@ def _validate(slides: list[dict]) -> list[dict]:
     return cleaned
 
 
+_MIN_SLIDES_OK     = 3      # 이거 미만이면 1회 retry
+_MIN_AVG_NARRATION = 100    # 평균 narration 자수. 이거 미만이면 1회 retry
+
+
+def _is_suspicious(slides: list[dict]) -> tuple[bool, str]:
+    """11초 영상 사건 가드 — 슬라이드 수 / narration 길이 임계 검증.
+    True 면 사용 가능, False 면 retry 추천."""
+    if len(slides) < _MIN_SLIDES_OK:
+        return True, f"슬라이드 {len(slides)}장 (최소 {_MIN_SLIDES_OK}장 미달)"
+    avg = sum(len(s.get("narration", "")) for s in slides) / max(len(slides), 1)
+    if avg < _MIN_AVG_NARRATION:
+        return True, f"평균 narration {avg:.0f}자 (최소 {_MIN_AVG_NARRATION}자 미달)"
+    return False, ""
+
+
 def generate_script(context: str, level_info: dict | None = None) -> list[dict]:
     """강의 자료 텍스트 → 슬라이드 스크립트 리스트.
 
     각 원소: {index, title, headline, bullets, narration}
+    sanity check 통과 못 하면 1회 retry — 11초 영상 사건 방지.
     """
-    raw = ask_qwen(context, SCRIPT_PROMPT, level_info, prefer_json=True)
+    def _one_shot(prompt_suffix: str = "") -> list[dict]:
+        raw = ask_qwen(context, SCRIPT_PROMPT + prompt_suffix, level_info, prefer_json=True)
+        return _validate(_extract_json_array(raw))
+
     try:
-        slides = _extract_json_array(raw)
-        return _validate(slides)
+        slides = _one_shot()
     except Exception as e:
-        snippet = raw[:300].replace("\n", " ")
-        raise RuntimeError(f"슬라이드 스크립트 생성 실패: {e} | 응답 앞부분: {snippet!r}") from e
+        snippet = ""    # 1차 실패 — 즉시 retry
+        try:
+            slides = _one_shot("\n\n반드시 6장 이상 만들고 각 narration 500자 이상 작성하라.")
+        except Exception as e2:
+            raise RuntimeError(f"슬라이드 스크립트 생성 실패: {e2}") from e2
+
+    bad, why = _is_suspicious(slides)
+    if bad:
+        # 1회 retry — 명시적 minimum 강조
+        try:
+            retry = _one_shot(f"\n\n주의: 이전 응답이 {why}. 반드시 6장 이상, narration 각 500자 이상 작성하라.")
+            r_bad, r_why = _is_suspicious(retry)
+            if not r_bad:
+                return retry
+            # retry 도 부족하면 더 나은 쪽 채택
+            if len(retry) > len(slides):
+                return retry
+        except Exception:
+            pass
+        # retry 도 실패 — 명시적 경고 후 원본 사용 (사용자에게 부족함 알림)
+        print(f"⚠ generate_script sanity check 실패 (1회 retry 후): {why}", flush=True)
+    return slides

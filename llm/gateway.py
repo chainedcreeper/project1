@@ -22,8 +22,9 @@ import time
 from contextlib import contextmanager
 
 
-_CONCURRENCY     = int(os.getenv("LLM_CONCURRENCY",     "1"))
-_DEFAULT_TIMEOUT = float(os.getenv("LLM_QUEUE_TIMEOUT", "180"))   # 큐 대기 한도(초)
+_CONCURRENCY      = int(os.getenv("LLM_CONCURRENCY",      "1"))   # 8B (legacy 호환)
+_CONCURRENCY_LARGE = int(os.getenv("LLM_CONCURRENCY_LARGE", "1"))  # 32B 등 큰 모델
+_DEFAULT_TIMEOUT  = float(os.getenv("LLM_QUEUE_TIMEOUT",  "180"))  # 큐 대기 한도(초)
 
 
 class GateBusy(RuntimeError):
@@ -93,5 +94,14 @@ class LLMGate:
             }
 
 
-# 전역 단일 인스턴스
-llm_gate = LLMGate(concurrency=_CONCURRENCY)
+# 모델 크기별 게이트 — L40S 같이 큰 GPU 면 8B 동시 여러 개, 32B 만 직렬화 가능
+llm_gate       = LLMGate(concurrency=_CONCURRENCY)        # 기본 (8B 포함)
+llm_gate_large = LLMGate(concurrency=_CONCURRENCY_LARGE)  # 32B 전용
+
+
+def gate_for(model_name: str) -> LLMGate:
+    """모델명 보고 적절한 게이트 선택. 32B/30B/70B/27B 는 large 게이트."""
+    lc = (model_name or "").lower()
+    if any(k in lc for k in ("32b", "30b", "70b", "27b", "exaone3.5:32")):
+        return llm_gate_large
+    return llm_gate

@@ -153,24 +153,26 @@ async def upload_document(
         )
 
     content = await file.read()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-        tmp.write(content)
-        tmp_path = tmp.name
+    # 원본 파일 영구 저장 — 페이지 이미지 렌더링 / 재처리 등에 사용
+    src_dir  = os.path.join(BASE_DIR, "uploaded_docs", student_id)
+    os.makedirs(src_dir, exist_ok=True)
+    # 옛 source 파일들 비움 (한 학생당 1개 자료 정책)
+    for old in os.listdir(src_dir):
+        try: os.remove(os.path.join(src_dir, old))
+        except OSError: pass
+    src_path = os.path.join(src_dir, f"source{ext}")
+    with open(src_path, "wb") as f:
+        f.write(content)
 
     loop = asyncio.get_running_loop()
     try:
         info = await loop.run_in_executor(
-            executor, lambda: process_document(tmp_path, student_id, filename=filename)
+            executor, lambda: process_document(src_path, student_id, filename=filename)
         )
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
 
     # 새 자료 업로드됨 — 메모리 job 만 폐기 (옛 mp4 는 강의자료별 이름으로 보관됨)
     with _video_lock:
@@ -178,6 +180,8 @@ async def upload_document(
     # 사전처리 캐시도 폐기 — 새 자료에 옛 요약·개념 쓰면 안 됨
     with _pre_lock:
         _pre_cache.pop(student_id, None)
+    # 페이지 이미지 캐시도 폐기 (옛 자료 페이지 PNG 잔재)
+    _page_cache_clear(student_id)
 
     return {"status": "ok", "filename": filename, **info}
 
@@ -489,7 +493,104 @@ async def find(req: FindRequest, user=Depends(get_current_user)):
     results = await loop.run_in_executor(
         executor, lambda: quick_find(req.query, sid, top_k=max(1, min(20, req.top_k))),
     )
-    return {"query": req.query, "results": results}
+    # 원본 파일이 PDF/PPT 면 페이지 이미지 URL 도 첨부 (UI 가 바로 띄움)
+    has_source = _source_path(sid) is not None
+    if has_source:
+        for r in results:
+            r["page_image"] = f"/page-image?page={r['page']}"
+    return {"query": req.query, "results": results, "has_source": has_source}
+
+
+# ── 페이지 이미지 (원본 PDF/PPT 한 페이지 PNG 렌더 + 디스크 캐시) ──
+
+def _source_path(sid: str) -> str | None:
+    """업로드 원본 파일 경로. 없으면 None."""
+    src_dir = os.path.join(BASE_DIR, "uploaded_docs", sid)
+    if not os.path.isdir(src_dir):
+        return None
+    for name in os.listdir(src_dir):
+        if name.startswith("source."):
+            return os.path.join(src_dir, name)
+    return None
+
+
+def _page_cache_dir(sid: str) -> str:
+    d = os.path.join(BASE_DIR, "uploaded_docs", sid, "_pages")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _page_cache_clear(sid: str) -> None:
+    d = os.path.join(BASE_DIR, "uploaded_docs", sid, "_pages")
+    if os.path.isdir(d):
+        for f in os.listdir(d):
+            try: os.remove(os.path.join(d, f))
+            except OSError: pass
+
+
+def _render_page_png(sid: str, page_num: int, dpi: int = 110) -> bytes | None:
+    """원본 PDF/PPTX 의 page_num (1-base) → PNG bytes. 디스크 캐시."""
+    src = _source_path(sid)
+    if not src:
+        return None
+    cache_path = os.path.join(_page_cache_dir(sid), f"page_{page_num:04d}.png")
+    if os.path.exists(cache_path):
+        with open(cache_path, "rb") as f:
+            return f.read()
+
+    ext = os.path.splitext(src)[1].lower()
+    pdf_path = src
+    tmp_pdf = None
+    if ext in (".pptx", ".ppt"):
+        # PPTX → PDF 변환 (LibreOffice headless). 변환 실패 시 None
+        import subprocess, shutil
+        soffice = shutil.which("soffice") or shutil.which("libreoffice")
+        if not soffice:
+            return None
+        tmp_pdf_dir = os.path.join(_page_cache_dir(sid), "_pdf")
+        os.makedirs(tmp_pdf_dir, exist_ok=True)
+        candidate = os.path.join(tmp_pdf_dir, os.path.splitext(os.path.basename(src))[0] + ".pdf")
+        if not os.path.exists(candidate):
+            try:
+                subprocess.run(
+                    [soffice, "--headless", "--convert-to", "pdf", "--outdir", tmp_pdf_dir, src],
+                    capture_output=True, timeout=120, check=True,
+                )
+            except Exception:
+                return None
+        if not os.path.exists(candidate):
+            return None
+        pdf_path = candidate
+    elif ext not in (".pdf",):
+        return None
+
+    try:
+        import fitz   # PyMuPDF
+        doc = fitz.open(pdf_path)
+        if page_num < 1 or page_num > len(doc):
+            return None
+        page = doc[page_num - 1]
+        mat = fitz.Matrix(dpi / 72, dpi / 72)
+        png = page.get_pixmap(matrix=mat).tobytes("png")
+        doc.close()
+        with open(cache_path, "wb") as f:
+            f.write(png)
+        return png
+    except Exception:
+        return None
+
+
+@app.get("/page-image")
+async def page_image(page: int, user=Depends(get_user_from_query)):
+    """원본 파일 한 페이지 PNG. find 결과 카드가 바로 띄움."""
+    sid = user["student_id"]
+    if page < 1 or page > 10000:
+        raise HTTPException(status_code=400, detail="유효하지 않은 페이지")
+    loop = asyncio.get_running_loop()
+    png = await loop.run_in_executor(executor, lambda: _render_page_png(sid, page))
+    if not png:
+        raise HTTPException(status_code=404, detail="페이지 이미지 없음 (원본 파일 미지원 또는 페이지 범위 초과)")
+    return Response(content=png, media_type="image/png", headers={"Cache-Control": "public, max-age=3600"})
 
 
 # ── LLM 게이트 상태 (동시 접속 모니터링) ────────────

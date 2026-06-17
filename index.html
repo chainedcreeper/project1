@@ -1538,7 +1538,7 @@ async function _runFind(query) {
       return;
     }
     const d = await r.json();
-    addFindResults(d.results || []);
+    addFindResults(d.results || [], { hasSource: !!d.has_source, query });
   } catch {
     document.getElementById(tid)?.remove();
     addBubble('검색 오류', false);
@@ -1615,21 +1615,34 @@ async function sendChat() {
   }
 }
 
-function addFindResults(results) {
+function addFindResults(results, opts) {
+  opts = opts || {};
   if (!results || !results.length) {
     addBubble('🔍 일치하는 부분 없음. 다른 키워드로 시도해줘.', false);
     return;
   }
   const fuzzyCount = results.filter(r => r.match === 'fuzzy').length;
+  const pages      = [...new Set(results.map(r => r.page))];
+  const cardId     = 'find-' + Date.now();
   const wrap = document.createElement('div');
   wrap.className = 'flex fade-up justify-start w-full';
   const inner = document.createElement('div');
-  inner.className = 'bg-amber-50 border border-amber-200 rounded-2xl rounded-tl-sm px-3 py-2.5 text-xs max-w-[90%] space-y-2';
+  inner.className = 'bg-amber-50 border border-amber-200 rounded-2xl rounded-tl-sm px-3 py-2.5 text-xs max-w-[95%] space-y-2';
+  // 미니맵 — 등장 페이지 칩, 클릭하면 해당 카드로 스크롤
+  const minimap = pages.length > 1 ? `
+    <div class="flex flex-wrap items-center gap-1 pt-0.5 pb-1">
+      <span class="text-[9px] text-amber-700">📍 페이지</span>
+      ${pages.map(p => `
+        <button onclick="document.getElementById('${cardId}-p${p}')?.scrollIntoView({behavior:'smooth', block:'center'})"
+                class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 hover:bg-amber-200">${p}</button>
+      `).join('')}
+    </div>` : '';
   inner.innerHTML = `
     <div class="text-[10px] font-semibold text-amber-700 flex items-center gap-1">
-      🔍 검색 결과 ${results.length}건 <span class="text-amber-500">·</span> <span class="text-amber-500">근거 페이지</span>
-      ${fuzzyCount ? `<span class="ml-1 text-[9px] text-purple-600">· 유사 ${fuzzyCount}건 포함</span>` : ''}
+      🔍 검색 결과 ${results.length}건 <span class="text-amber-500">·</span> <span class="text-amber-500">${pages.length}개 페이지</span>
+      ${fuzzyCount ? `<span class="ml-1 text-[9px] text-purple-600">· 유사 ${fuzzyCount}건</span>` : ''}
     </div>
+    ${minimap}
     ${results.map(r => {
       const isFuzzy = r.match === 'fuzzy';
       const badge   = isFuzzy
@@ -1637,13 +1650,20 @@ function addFindResults(results) {
         : '';
       const scoreText = isFuzzy ? `유사도 ${(r.score * 100).toFixed(0)}%` : `match ${r.score}`;
       const borderCol = isFuzzy ? 'border-purple-200' : 'border-amber-200';
+      const imgBlock  = r.page_image ? `
+        <img src="${r.page_image}" loading="lazy" alt="p.${r.page}"
+             class="w-full rounded border border-slate-200 mb-1.5 max-h-72 object-contain bg-white"
+             onclick="window.open('${r.page_image}', '_blank')"
+             style="cursor:zoom-in"
+             onerror="this.style.display='none'" />` : '';
       return `
-      <div class="bg-white border ${borderCol} rounded-md px-2.5 py-2">
+      <div id="${cardId}-p${r.page}" class="bg-white border ${borderCol} rounded-md px-2.5 py-2">
         <div class="flex items-center gap-1.5 mb-1">
           <span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700">p.${r.page}</span>
           ${badge}
           <span class="text-[9px] text-slate-400">${scoreText}</span>
         </div>
+        ${imgBlock}
         <p class="text-[11px] text-slate-700 leading-[1.6] whitespace-pre-wrap">${escapeHtml(r.snippet)}</p>
       </div>
       `;
